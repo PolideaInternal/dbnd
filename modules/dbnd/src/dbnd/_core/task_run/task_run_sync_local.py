@@ -1,9 +1,16 @@
 import logging
 import os
 
-from dbnd._core.parameter.parameter_definition import _ParameterKind
+from copy import deepcopy
+from typing import Type
+
+from dbnd._core.parameter.parameter_definition import (
+    ParameterDefinition,
+    _ParameterKind,
+)
 from dbnd._core.task_run.task_run_ctrl import TaskRunCtrl
-from targets import DbndLocalFileMetadataRegistry, DirTarget, FileTarget, target
+from targets import DbndLocalFileMetadataRegistry, FileTarget, target
+from targets.multi_target import MultiTarget
 
 
 logger = logging.getLogger(__name__)
@@ -27,25 +34,43 @@ class TaskRunLocalSyncer(TaskRunCtrl):
                 and not p_val.fs.local
             ):
                 # Target requires local access, it points to a remote path that must be synced-to from a local path
-                local_target = target(
-                    self.local_sync_root,
-                    os.path.basename(p_val.path),
-                    config=p_val.config,
-                )
-                if p_def.kind == _ParameterKind.task_output:
-                    # Output should be substituted for local path and synced post execution
-                    self.outputs_to_sync.append((p_def, p_val, local_target))
+                local_target = self._local_cache_target(p_val)
 
-                else:
-                    # Use DbndLocalFileMetadataRegistry to sync inputs only when necessary
-                    dbnd_meta_cache = DbndLocalFileMetadataRegistry.get_or_create(
-                        local_target
-                    )
+                self._sync_input_or_output(p_def, p_val, local_target)
 
-                    # When syncing remote to local -> We can't use MD5, so use TTL instead
-                    if dbnd_meta_cache.expired or not local_target.exists():
-                        # If TTL is invalid, or local file doesn't exist -> Sync to local
-                        self.inputs_to_sync.append((p_def, p_val, local_target))
+            elif isinstance(p_val, MultiTarget):
+                local_targets = []
+                for target_ in p_val.targets:
+                    if target_.config.require_local_access and not target_.fs.local:
+                        local_target = self._local_cache_target(target_)
+                        self._sync_input_or_output(p_def, target_, local_target)
+                        local_target.append(local_target)
+
+                if local_targets:
+                    local_multitarget = MultiTarget(local_targets)
+
+    def _local_cache_target(self, target_):
+        # type: (FileTarget) -> FileTarget
+        return target(
+            self.task_run.attemp_folder_local_cache,
+            os.path.basename(target_.path),
+            config=target_.config,
+        )
+
+    def _sync_input_or_output(self, param_definition, old_target, new_target):
+        # type: (ParameterDefinition, Type[DataTarget], Type[DataTarget]) -> None
+        if param_definition.kind == _ParameterKind.task_output:
+            # Output should be substituted for local path and synced post execution
+            self.outputs_to_sync.append((param_definition, old_target, new_target))
+
+        else:
+            # Use DbndLocalFileMetadataRegistry to sync inputs only when necessary
+            dbnd_meta_cache = DbndLocalFileMetadataRegistry.get_or_create(new_target)
+
+            # When syncing remote to local -> We can't use MD5, so use TTL instead
+            if dbnd_meta_cache.expired or not new_target.exists():
+                # If TTL is invalid, or local file doesn't exist -> Sync to local
+                self.inputs_to_sync.append((param_definition, old_target, new_target))
 
     def sync_pre_execute(self):
         if self.inputs_to_sync:
